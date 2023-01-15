@@ -21,6 +21,12 @@ from utils import ThousandLandmarksDataset
 from utils import restore_landmarks_batch, create_submission
 
 import pretrainedmodels
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -91,47 +97,84 @@ def predict(model, loader, device):
 
 
 def lr(step):
-    return 0.1 + 0.9 * (0.998) ** step
+    return 0.9 ** step
 
 
 def main(args):
     os.makedirs("runs", exist_ok=True)
 
-    # 1. prepare data & models
-    train_transforms = transforms.Compose([
-        ScaleMinSideToSize((CROP_SIZE, CROP_SIZE)),
-        CropCenter(CROP_SIZE),
-        TransformByKeys(transforms.ToPILImage(), ("image",)),
-        TransformByKeys(transforms.ToTensor(), ("image",)),
-        TransformByKeys(transforms.RandomInvert(0.1), ("image",)),
-        TransformByKeys(transforms.RandomAutocontrast(0.1), ("image",)),
-        TransformByKeys(transforms.RandomGrayscale(0.01), ("image",)),
-        TransformByKeys(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.25, 0.25, 0.25]), ("image",)),
+
+    albumentations_transform_pos = A.Compose([
+                A.ShiftScaleRotate(p=0.01),
+                A.Rotate([-25, 25], p=0.01)
+    ],  keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+
+    albumentations_transform = A.Compose([
+                A.Blur(p=0.02),
+                A.ColorJitter(p=0.02),
+                A.RandomBrightnessContrast(p=0.02),
+                A.Sharpen(p=0.02),
+                A.CoarseDropout(min_holes=2, max_holes=8, min_width=5, max_width=20, min_height=5, max_height=20, p=0.01),
+                A.ImageCompression(p=0.01),
+                A.Downscale(p=0.01),
+                A.ToGray(p=0.01)
     ])
 
+
+    augmentation_transform = transforms.Compose([
+            TransformByKeys(lambda sample: albumentations_transform(image=np.array(sample["image"])), ('image', ), album=True),
+            TransformByKeys(lambda sample: albumentations_transform_pos(image=np.array(sample["image"]), keypoints=np.array(sample["landmarks"]).reshape(-1, 2)), ('image', 'landmarks'), album=True),
+            ScaleMinSideToSize((CROP_SIZE, CROP_SIZE)),
+            CropCenter(CROP_SIZE),
+            TransformByKeys(transforms.ToTensor(), ("image", )),
+            TransformByKeys(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.25, 0.25, 0.25]), ("image",))
+   ])
+
+
+    test_transforms = transforms.Compose([
+        ScaleMinSideToSize((CROP_SIZE, CROP_SIZE)),
+        CropCenter(CROP_SIZE),
+        TransformByKeys(transforms.ToTensor(), ("image", )),
+        TransformByKeys(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.25, 0.25, 0.25]), ("image", ))
+    ])
+
+
     print("Reading data...")
-    train_dataset = ThousandLandmarksDataset(os.path.join(args.data, "train"), train_transforms, split="train")
+    train_dataset = ThousandLandmarksDataset(os.path.join(args.data, "train"), augmentation_transform, split="train")
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
                                   shuffle=True, drop_last=True)
-    val_dataset = ThousandLandmarksDataset(os.path.join(args.data, "train"), train_transforms, split="val")
+    val_dataset = ThousandLandmarksDataset(os.path.join(args.data, "train"), test_transforms, split="val")
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
                                 shuffle=False, drop_last=False)
 
     device = torch.device("cuda:0") if args.gpu and torch.cuda.is_available() else torch.device("cpu")
 
     print("Creating model...")
-    model = pretrainedmodels.se_resnext50_32x4d(pretrained='imagenet')
+    model = models.densenet161(pretrained=True)
     model.requires_grad_(True)
 
-    model.avg_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
-    model.avg_pool.requires_grad_(True)
-    
-    model.last_linear = nn.Linear(model.last_linear.in_features, 2 * NUM_PTS, bias=True)
-    model.last_linear.requires_grad_(True)
+
+    #model.avg_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+    model.classifier = nn.Linear(model.classifier.in_features, 2 * NUM_PTS, bias=True)
+
+    ##### Fine tuning  ##################################################################
+    # with open(os.path.join("runs", "resnet50@224_best.pth"), "rb") as fp:
+    #     best_state_dict = torch.load(fp, map_location="cpu")
+    #     model.load_state_dict(best_state_dict)
+
+
+    # #model.layer2.requires_grad_(True)
+    # model.layer3.requires_grad_(True)
+    # model.layer4.requires_grad_(True)
+    #####################################################################################
+
+    #model.avg_pool.requires_grad_(True)    
+    model.classifier.requires_grad_(True)
 
     model.to(device)
 
-    optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr)
     loss_fn = fnn.mse_loss
 
@@ -149,7 +192,7 @@ def main(args):
                 torch.save(model.state_dict(), fp)
 
     # 3. predict
-    test_dataset = ThousandLandmarksDataset(os.path.join(args.data, "test"), train_transforms, split="test")
+    test_dataset = ThousandLandmarksDataset(os.path.join(args.data, "test"), test_transforms, split="test")
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
                                  shuffle=False, drop_last=False)
 

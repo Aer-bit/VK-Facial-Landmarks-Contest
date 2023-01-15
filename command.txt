@@ -1,0 +1,2 @@
+python train_mod.py --name "resnet152" --data contest01_data -b 64 -e 30 --gpu
+
